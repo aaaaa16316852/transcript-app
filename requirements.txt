@@ -1,0 +1,5 @@
+streamlit>=1.42
+pdfplumber>=0.11
+google-genai>=1.0
+pandas
+markdown
