@@ -279,6 +279,7 @@ if run:
 
         todo = [k for k in keys if force or f"{sig}:{k}" not in cache]  # 已解析過的模組直接沿用
         errors = {}
+        prog = {}
         if todo:
             with st.status(f"解析中（{len(todo)} 個模組並行）…", expanded=True) as status:
                 images = []
@@ -354,6 +355,7 @@ if run:
             "errors": errors,
             "elapsed": time.time() - t_start,
             "reused": [k for k in keys if k not in todo],
+            "logs": {k: prog[k].get("log", []) for k in prog},
             "model": "、".join(sorted({r.get("model", model) for k in keys if (r := cache.get(f"{sig}:{k}"))})) or model,
         }
         st.rerun()  # 重新整理側邊欄用量
@@ -413,6 +415,14 @@ if view:
         orig = "、".join(f"{core.MODULES[k]['label']} {r['secs']:.1f} 秒" for k, r in res.items())
         note += f" ｜ 實際解析耗時：{orig} ｜ Token：輸入 {tp:,}／輸出 {to:,}"
     st.caption(note)
+    log_lines = []
+    for k in view["keys"]:
+        entries = (view["results"].get(k) or {}).get("log") or view.get("logs", {}).get(k, [])
+        for x in entries:
+            log_lines.append(f"{core.MODULES[k]['label']}｜{x['model']}｜{x['secs']:.0f} 秒｜{x['outcome']}")
+    if log_lines:
+        with st.expander("🔍 嘗試紀錄（診斷速度用）"):
+            st.text("\n".join(log_lines))
 
     for k, msg in view["errors"].items():
         st.error(f"{core.MODULES[k]['label']} 失敗：{msg}（再按一次「開始解析」只會重跑失敗的模組）")

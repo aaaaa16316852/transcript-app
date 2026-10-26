@@ -274,7 +274,8 @@ def progress_view(p: dict) -> tuple[float, str]:
     return 0.05, f"⏳ 準備中 · {el:.0f} 秒"
 
 
-def _generate_one(client, model: str, contents, key: str, prog, t0: float) -> dict:
+def _generate_one(client, model: str, contents, key: str, prog, t0: float, max_retries: int = 3, log=None) -> dict:
+    log = log if log is not None else []
     spec = MODULES[key]
     cfg = dict(system_instruction=SYSTEM_PROMPT, temperature=0.1, max_output_tokens=spec["max_tokens"])
     if spec["json"]:
@@ -286,6 +287,7 @@ def _generate_one(client, model: str, contents, key: str, prog, t0: float) -> di
         if thinking_off:
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         buf, usage, finish = "", None, None
+        ta = time.time()
         _set(prog, stage="waiting", model=model, text="")
         try:
             stream = client.models.generate_content_stream(
@@ -302,13 +304,15 @@ def _generate_one(client, model: str, contents, key: str, prog, t0: float) -> di
                     finish = chunk.candidates[0].finish_reason or finish
                 except Exception:  # noqa: BLE001
                     pass
+            log.append(dict(model=model, secs=time.time() - ta, outcome="成功"))
             break
         except Exception as e:  # noqa: BLE001
             msg = str(e)
+            log.append(dict(model=model, secs=time.time() - ta, outcome=msg.replace("\n", " ")[:90]))
             if thinking_off and re.search(r"thinking|budget", msg, re.I):
                 thinking_off = False
                 continue
-            if attempt < 3 and _RETRYABLE.search(msg):
+            if attempt < max_retries and _RETRYABLE.search(msg):
                 attempt += 1
                 wait = delay * (1 + random.random() * 0.25)
                 _set(prog, stage="retry", note=f"{model} 忙碌，{wait:.0f} 秒後第 {attempt} 次重試")
@@ -340,10 +344,14 @@ def generate(client, model: str, contents, key: str, prog=None, fallbacks=()) ->
     """主要模型重試仍失敗（忙碌／找不到）時，依序改用備用模型。"""
     models = [model] + [m for m in fallbacks if m and m != model]
     t0 = time.time()
+    log: list = []
+    _set(prog, log=log)
     switch = re.compile(r"404|NOT_FOUND|" + _RETRYABLE.pattern, re.I)
     for i, m in enumerate(models):
         try:
-            return _generate_one(client, m, contents, key, prog, t0)
+            res = _generate_one(client, m, contents, key, prog, t0, 1 if i < len(models) - 1 else 3, log)
+            res["log"] = log
+            return res
         except Exception as e:  # noqa: BLE001
             if i < len(models) - 1 and switch.search(str(e)):
                 _set(prog, stage="retry", note=f"{m} 無法使用，改用備用模型 {models[i + 1]}")
