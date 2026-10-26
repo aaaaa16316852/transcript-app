@@ -404,7 +404,7 @@ def parse_route(text: str) -> pd.DataFrame:
 
 
 def maps_url(addr: str) -> str | None:
-    a = (addr or "").strip()
+    a = re.sub(r"[*＊]+", "", (addr or "")).strip()  # 門牌被遮蔽時只導航到路名
     if not a or "未載" in a:
         return None
     return "https://www.google.com/maps/search/?api=1&query=" + quote(a)

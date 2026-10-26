@@ -168,6 +168,7 @@ with st.sidebar:
         precise = st.toggle("精準版面模式（較慢）", value=False, help="保留 PDF 欄位對齊；一般電子謄本不需開啟。")
         vision = st.toggle("加強視覺核對（較慢、較準）", value=False, help="把含所有權部、住址的頁面轉成圖片一併送審。")
         mask = st.toggle("送出前遮蔽身分證後六碼", value=True)
+        force = st.toggle("強制重新解析（略過快取）", value=False, help="相同檔案與設定預設會沿用結果；要實測耗時或重新跑時才開。")
 
 # ==========================================
 # 主畫面
@@ -276,7 +277,7 @@ if run:
                     h.update(d["bytes"])
         sig = h.hexdigest()[:16]
 
-        todo = [k for k in keys if f"{sig}:{k}" not in cache]  # 已解析過的模組直接沿用
+        todo = [k for k in keys if force or f"{sig}:{k}" not in cache]  # 已解析過的模組直接沿用
         errors = {}
         if todo:
             with st.status(f"解析中（{len(todo)} 個模組並行）…", expanded=True) as status:
@@ -353,7 +354,7 @@ if run:
             "errors": errors,
             "elapsed": time.time() - t_start,
             "reused": [k for k in keys if k not in todo],
-            "model": model,
+            "model": "、".join(sorted({r.get("model", model) for k in keys if (r := cache.get(f"{sig}:{k}"))})) or model,
         }
         st.rerun()  # 重新整理側邊欄用量
 
@@ -400,9 +401,17 @@ view = st.session_state.get("view")
 if view:
     st.divider()
     st.markdown("### 📑 解析結果")
-    note = f"⏱ 本次耗時 {view['elapsed']:.1f} 秒 ｜ 模型：{view['model']}"
-    if view["reused"]:
-        note += " ｜ 已沿用先前結果：" + "、".join(core.MODULES[k]["label"] for k in view["reused"])
+    res = view["results"]
+    if view["reused"] and len(view["reused"]) == len(view["keys"]):
+        note = "⚡ 本次完全沿用先前結果（零等待、零消耗額度）"
+    else:
+        note = f"⏱ 本次耗時 {view['elapsed']:.1f} 秒"
+    note += f" ｜ 模型：{view['model']}"
+    if res:
+        tp = sum(r["p"] for r in res.values())
+        to = sum(r["o"] for r in res.values())
+        orig = "、".join(f"{core.MODULES[k]['label']} {r['secs']:.1f} 秒" for k, r in res.items())
+        note += f" ｜ 實際解析耗時：{orig} ｜ Token：輸入 {tp:,}／輸出 {to:,}"
     st.caption(note)
 
     for k, msg in view["errors"].items():
