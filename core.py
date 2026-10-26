@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
+import random
 import re
 import sqlite3
 import time
@@ -72,9 +74,12 @@ _WATERMARK_SIZE = 30  # 正文約 9–12pt；浮水印字級遠大於此（實�
 
 
 def _needs_vision(text: str) -> bool:
-    """文字層過少（掃描檔），或「住址」標籤後沒有內容（地政網站常把住址渲染成圖片）。"""
+    """文字層過少（掃描檔），或所有權部的「住址」標籤後沒有內容（地政網站把住址渲染成逐字小圖）。
+    他項權利部的住址是抵押權人（銀行、農會）的，不影響外勤拜訪，所以不送圖。"""
     if len(text.strip()) < 30:
         return True
+    if "他項權利部" in text:
+        return False
     return any(re.search(r"住址\s*$", ln) for ln in text.splitlines())
 
 
@@ -99,25 +104,66 @@ def build_doc_text(name: str, pages_text: list[str]) -> str:
     return f"---【檔案：{name}（共 {len(pages_text)} 頁）】---\n{body}"
 
 
+def _img_part(im, fmt: str):
+    buf = io.BytesIO()
+    if fmt == "PNG":
+        im.save(buf, "PNG")
+        return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
+    im.save(buf, "JPEG", quality=80)
+    return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+
+
+def _strips(page, gap: float = 8.0) -> list[dict]:
+    """地政網站把住址逐字渲染成小圖：依垂直位置把頁面上的圖片分群，每群就是一列欄位。"""
+    groups: list[dict] = []
+    for im in sorted(page.images, key=lambda x: x["top"]):
+        if groups and im["top"] - groups[-1]["bottom"] < gap:
+            g = groups[-1]
+            g["x0"], g["x1"] = min(g["x0"], im["x0"]), max(g["x1"], im["x1"])
+            g["bottom"] = max(g["bottom"], im["bottom"])
+        else:
+            groups.append(dict(x0=im["x0"], x1=im["x1"], top=im["top"], bottom=im["bottom"]))
+    return groups
+
+
 def collect_images(docs: list[dict], deep: bool) -> list:
-    """掃描頁一律轉圖；deep=True 時，含關鍵字的頁面也轉圖供視覺核對。"""
+    """掃描頁送整頁；住址讀不到的頁面只送住址那一條（高解析度、省 token）。
+    deep=True 時，含關鍵字的頁面也送整頁供視覺核對。每張圖前附一段說明文字。"""
     parts: list = []
+    n_img = 0
     for d in docs:
         if d["kind"] != "pdf":
             continue
-        idx = set(d["scanned"])
+        need = set(d["scanned"])
+        full = {i for i in need if len(d["pages_text"][i].strip()) < 30}
         if deep:
-            idx |= {i for i, t in enumerate(d["pages_text"]) if any(k in t for k in VISION_KEYWORDS)}
-        if not idx:
+            full |= {i for i, t in enumerate(d["pages_text"]) if any(k in t for k in VISION_KEYWORDS)}
+        crop = need - full
+        if not (full or crop):
             continue
         with pdfplumber.open(io.BytesIO(d["bytes"])) as pdf:
-            for i in sorted(idx):
-                if len(parts) >= MAX_VISION_PAGES:
+            for i in sorted(full | crop):
+                if n_img >= MAX_VISION_PAGES:
                     return parts
-                im = pdf.pages[i].to_image(resolution=130).original.convert("RGB")
-                buf = io.BytesIO()
-                im.save(buf, "JPEG", quality=80)
-                parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+                page = pdf.pages[i]
+                if i in crop:
+                    groups = _strips(page)[:6]
+                    if groups:
+                        scale = 300 / 72
+                        big = page.to_image(resolution=300).original.convert("RGB")
+                        for k, g in enumerate(groups, 1):
+                            box = (
+                                max(0, (g["x0"] - 4) * scale), max(0, (g["top"] - 3) * scale),
+                                min(big.width, (g["x1"] + 4) * scale), min(big.height, (g["bottom"] + 3) * scale),
+                            )
+                            label = f"【住址截圖｜{d['name']} 第{i + 1}頁" + (f" 第{k}列" if len(groups) > 1 else "") + "】"
+                            parts.append(types.Part.from_text(text=label))
+                            parts.append(_img_part(big.crop(tuple(int(v) for v in box)), "PNG"))
+                            n_img += 1
+                        continue
+                parts.append(types.Part.from_text(text=f"【整頁截圖｜{d['name']} 第{i + 1}頁】"))
+                parts.append(_img_part(page.to_image(resolution=130).original.convert("RGB"), "JPEG"))
+                n_img += 1
     return parts
 
 
@@ -131,7 +177,8 @@ SYSTEM_PROMPT = (
     "2. 地號、面積、持分、金額、日期須逐字核對原文，不得四捨五入或改寫。\n"
     "3. 引用事項時註明來源頁碼或登記次序（例如：第2頁、登記次序0003）。\n"
     "4. 使用繁體中文，直接輸出結果，不要開場白、結尾客套或重複題目。\n"
-    "5. 若附有頁面圖片，文字層缺漏或不一致的欄位（如住址）以圖片為準。"
+    "5. 若附有圖片（整頁或住址截圖，圖前有文字標明來源檔案與頁碼），文字層缺漏的欄位（如住址）以圖片為準；"
+    "圖中看不清楚的字請寫「（辨識不清）」，嚴禁猜測或補字。"
 )
 
 _ROUTE_PROMPT = """任務：整理外勤拜訪名單。
@@ -197,22 +244,64 @@ def make_client(api_key: str):
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=120_000))
 
 
-def generate(client, model: str, contents, key: str) -> dict:
+# ---- 進度（由工作執行緒寫入、主執行緒讀取；不碰任何 Streamlit 物件）----
+def new_progress() -> dict:
+    return dict(stage="queued", text="", note="", model="", t0=time.time())
+
+
+def _set(prog, **kw) -> None:
+    if prog is not None:
+        prog.update(kw)
+
+
+def progress_view(p: dict) -> tuple[float, str]:
+    """回傳 (0~1 進度, 顯示文字)。生成中的進度以漸近曲線估算，僅供「有在動」的視覺回饋。"""
+    el = time.time() - p["t0"]
+    n = len(p["text"])
+    st_ = p["stage"]
+    if st_ == "done":
+        return 1.0, f"✅ 完成 · {el:.1f} 秒"
+    if st_ == "failed":
+        return 1.0, f"❌ 失敗 · {el:.0f} 秒"
+    if st_ == "retry":
+        return 0.25, f"🔁 {p['note']}（已等 {el:.0f} 秒）"
+    if st_ == "generating":
+        frac = 0.3 + 0.6 * (1 - math.exp(-n / 1200))
+        return frac, f"✍️ 生成中 · 已收到 {n:,} 字 · {el:.0f} 秒"
+    if st_ == "waiting":
+        hint = "（Google 尖峰時段較慢，仍在等待…）" if el > 20 else ""
+        return 0.2 + 0.1 * min(1.0, el / 20), f"📤 已送出，等待模型回應 · {el:.0f} 秒{hint}"
+    return 0.05, f"⏳ 準備中 · {el:.0f} 秒"
+
+
+def _generate_one(client, model: str, contents, key: str, prog, t0: float) -> dict:
     spec = MODULES[key]
     cfg = dict(system_instruction=SYSTEM_PROMPT, temperature=0.1, max_output_tokens=spec["max_tokens"])
     if spec["json"]:
         cfg["response_mime_type"] = "application/json"
 
-    thinking_off, attempt, delay = True, 0, 1.5  # 關閉思考以求速度；模型不支援時自動退回
-    t0 = time.time()
+    thinking_off, attempt, delay = True, 0, 2.0  # 關閉思考以求速度；模型不支援時自動退回
     while True:
         kwargs = dict(cfg)
         if thinking_off:
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        buf, usage, finish = "", None, None
+        _set(prog, stage="waiting", model=model, text="")
         try:
-            resp = client.models.generate_content(
+            stream = client.models.generate_content_stream(
                 model=model, contents=contents, config=types.GenerateContentConfig(**kwargs)
             )
+            for chunk in stream:
+                piece = getattr(chunk, "text", None)
+                if piece:
+                    buf += piece
+                    _set(prog, stage="generating", text=buf, note="")
+                if getattr(chunk, "usage_metadata", None):
+                    usage = chunk.usage_metadata
+                try:
+                    finish = chunk.candidates[0].finish_reason or finish
+                except Exception:  # noqa: BLE001
+                    pass
             break
         except Exception as e:  # noqa: BLE001
             msg = str(e)
@@ -221,37 +310,61 @@ def generate(client, model: str, contents, key: str) -> dict:
                 continue
             if attempt < 3 and _RETRYABLE.search(msg):
                 attempt += 1
-                time.sleep(delay)
+                wait = delay * (1 + random.random() * 0.25)
+                _set(prog, stage="retry", note=f"{model} 忙碌，{wait:.0f} 秒後第 {attempt} 次重試")
+                time.sleep(wait)
                 delay *= 2
                 continue
             raise
 
-    um = getattr(resp, "usage_metadata", None)
-    p = (getattr(um, "prompt_token_count", 0) or 0) if um else 0
-    o = (
-        (getattr(um, "candidates_token_count", 0) or 0) + (getattr(um, "thoughts_token_count", 0) or 0)
-        if um
+    p_tok = (getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
+    o_tok = (
+        (getattr(usage, "candidates_token_count", 0) or 0) + (getattr(usage, "thoughts_token_count", 0) or 0)
+        if usage
         else 0
     )
-    truncated = False
-    try:
-        truncated = "MAX_TOKENS" in str(resp.candidates[0].finish_reason)
-    except Exception:  # noqa: BLE001
-        pass
-
-    out = dict(text=resp.text or "", p=p, o=o, secs=time.time() - t0, truncated=truncated, df=None)
+    out = dict(
+        text=buf, p=p_tok, o=o_tok, secs=time.time() - t0,
+        truncated="MAX_TOKENS" in str(finish), df=None, model=model,
+    )
     if key == "route":
         try:
-            out["df"] = parse_route(out["text"])
+            out["df"] = parse_route(buf)
         except Exception:  # noqa: BLE001
             pass
+    _set(prog, stage="done", text=buf)
     return out
 
 
-def run_module(client, model, key, category, zoning, text, images) -> dict:
+def generate(client, model: str, contents, key: str, prog=None, fallbacks=()) -> dict:
+    """主要模型重試仍失敗（忙碌／找不到）時，依序改用備用模型。"""
+    models = [model] + [m for m in fallbacks if m and m != model]
+    t0 = time.time()
+    switch = re.compile(r"404|NOT_FOUND|" + _RETRYABLE.pattern, re.I)
+    for i, m in enumerate(models):
+        try:
+            return _generate_one(client, m, contents, key, prog, t0)
+        except Exception as e:  # noqa: BLE001
+            if i < len(models) - 1 and switch.search(str(e)):
+                _set(prog, stage="retry", note=f"{m} 無法使用，改用備用模型 {models[i + 1]}")
+                continue
+            _set(prog, stage="failed")
+            raise
+
+
+def run_module(client, model, key, category, zoning, text, images, prog=None, fallbacks=()) -> dict:
     prompt = build_prompt(key, category, zoning, text)
     contents = [*images, prompt] if images else prompt
-    return generate(client, model, contents, key)
+    return generate(client, model, contents, key, prog, fallbacks)
+
+
+def partial_route_df(text: str):
+    """串流中途的拜訪表預覽：輸出未完成時保留已完整的物件。"""
+    try:
+        df = parse_route(text)
+        return df if len(df) else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ==========================================

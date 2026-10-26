@@ -110,6 +110,8 @@ def friendly(e: Exception) -> str:
         return "找不到模型，請到側邊欄「進階設定」確認模型名稱"
     if "429" in m or "RESOURCE_EXHAUSTED" in m:
         return "API 額度或速率已達上限，請稍後再試或更換金鑰"
+    if "503" in m or "UNAVAILABLE" in m:
+        return "Google 伺服器目前忙碌，已自動重試仍失敗；請稍候再按一次，或在「進階設定」加入備用模型"
     return m[:300]
 
 
@@ -157,6 +159,12 @@ with st.sidebar:
             help="填入後使用自己的額度，不受每日上限限制。",
         )
         model = st.text_input("模型名稱", value=str(secret("GEMINI_MODEL", core.DEFAULT_MODEL)))
+        fb_raw = st.text_input(
+            "備用模型（選填）",
+            value=str(secret("GEMINI_FALLBACK_MODELS", "")),
+            help="主要模型忙碌或無法使用時自動改用；多個以逗號分隔。名稱需為你帳號可用的模型。",
+        )
+        fallbacks = tuple(x.strip() for x in fb_raw.split(",") if x.strip())
         precise = st.toggle("精準版面模式（較慢）", value=False, help="保留 PDF 欄位對齊；一般電子謄本不需開啟。")
         vision = st.toggle("加強視覺核對（較慢、較準）", value=False, help="把含所有權部、住址的頁面轉成圖片一併送審。")
         mask = st.toggle("送出前遮蔽身分證後六碼", value=True)
@@ -223,7 +231,7 @@ if has_input:
     m2.metric("📄 總頁數", f"{total_pages} 頁")
     m3.metric("🔤 文字量", f"約 {len(final_text):,} 字")
     if scanned_n:
-        st.warning(f"有 {scanned_n} 頁含文字層讀不到的欄位（如住址）或為掃描檔，將自動加送頁面圖片辨識，速度會稍慢。")
+        st.warning(f"有 {scanned_n} 頁含文字層讀不到的欄位（如住址）或為掃描檔，將自動加送住址截圖（掃描檔則送整頁）辨識，速度會稍慢。")
     if total_pages > 80:
         st.warning("總頁數偏多，解析時間與費用會明顯增加，建議分批處理。")
     with st.expander("🔍 檢視送出的精煉文字"):
@@ -280,24 +288,62 @@ if run:
                     except Exception as e:  # noqa: BLE001
                         st.write(f"⚠️ 頁面轉圖失敗，改用純文字：{e}")
                 client = core.make_client(api_key)
-                st.write(f"⚡ 已同時送出 {len(todo)} 個解析請求…")
+
+                overall = st.progress(0.05, text="已同時送出解析請求…")
+                prog = {k: core.new_progress() for k in todo}
+                head = {k: st.empty() for k in todo}
+                body = {k: st.empty() for k in todo}
+                shown = {k: (-1, 0.0) for k in todo}
+
+                def draw_preview(k, txt):
+                    if core.MODULES[k]["json"]:
+                        df = core.partial_route_df(txt)
+                        if df is None:
+                            return
+                        cols = ["拜訪站別", "所有權人", "戶籍/通訊地址", "持分"]
+                        with body[k].container():
+                            st.caption(f"即時預覽：已辨識 {len(df)} 筆（完成後會顯示完整表格與導航）")
+                            st.dataframe(core.route_display_df(df)[cols], hide_index=True, **WIDE)
+                    else:
+                        body[k].markdown(txt)
+
+                def draw(force=False):
+                    fracs = []
+                    for k in todo:
+                        frac, label = core.progress_view(prog[k])
+                        fracs.append(frac)
+                        head[k].markdown(f"**{core.MODULES[k]['label']}**　{label}")
+                        txt = prog[k]["text"]
+                        last_n, last_t = shown[k]
+                        if txt and len(txt) != last_n and (force or time.time() - last_t > 0.8):
+                            shown[k] = (len(txt), time.time())
+                            draw_preview(k, txt)
+                    done_n = sum(1 for k in todo if prog[k]["stage"] == "done")
+                    overall.progress(sum(fracs) / len(fracs), text=f"解析中… 已完成 {done_n} / {len(todo)} 個模組")
+
                 with ThreadPoolExecutor(max_workers=len(todo)) as ex:
                     futs = {
-                        ex.submit(core.run_module, client, model, k, category, zoning, final_text, images): k
+                        ex.submit(
+                            core.run_module, client, model, k, category, zoning, final_text, images, prog[k], fallbacks
+                        ): k
                         for k in todo
                     }
-                    for fut in as_completed(futs):
-                        k = futs[fut]
-                        label = core.MODULES[k]["label"]
-                        try:
-                            r = fut.result()
-                            cache[f"{sig}:{k}"] = r
-                            core.log_usage(user, model, k, r["p"], r["o"])
-                            st.write(f"✅ {label} · {r['secs']:.1f} 秒")
-                        except Exception as e:  # noqa: BLE001
-                            errors[k] = friendly(e)
-                            st.write(f"❌ {label}")
-                status.update(label="解析完成" if not errors else "部分模組失敗", state="complete" if not errors else "error")
+                    while not all(f.done() for f in futs):
+                        draw()
+                        time.sleep(0.3)
+                    draw(force=True)
+
+                for fut, k in futs.items():
+                    try:
+                        r = fut.result()
+                        cache[f"{sig}:{k}"] = r
+                        core.log_usage(user, r.get("model", model), k, r["p"], r["o"])
+                    except Exception as e:  # noqa: BLE001
+                        errors[k] = friendly(e)
+                status.update(
+                    label="解析完成" if not errors else "部分模組失敗",
+                    state="complete" if not errors else "error",
+                )
             while len(cache) > 20:  # 限制單一連線的記憶體占用
                 cache.pop(next(iter(cache)))
 
